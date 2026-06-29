@@ -1,13 +1,16 @@
-"""Resolve a replay *source* into a parsed replay dict.
+"""Optional feature: download a single FUMBBL replay over HTTP.
 
-This is intentionally NOT a scraper -- it fetches a single replay that the user
-explicitly points at, caches it on disk, and is polite (identifying User-Agent).
-A source may be:
+This module is the *only* part of fumbblr that touches the network, and it is
+imported lazily by :mod:`fumbblr.sources` -- a file-only deployment never loads
+it.  It is intentionally NOT a scraper: it fetches a single replay the user
+explicitly points at, caches it on disk, and is polite (identifying User-Agent,
+small inter-request delay).
 
-  * a local ``.gz`` / ``.json`` replay file            -> loaded directly
-  * a FUMBBL ``.jnlp`` launcher file                   -> replay id extracted
-  * a bare replay id (e.g. 1901960)                    -> replay/get/{id}/gz
-  * a bare match  id (e.g. 4701297)                    -> match/get -> replayId
+A remote source is one of:
+
+  * a FUMBBL ``.jnlp`` launcher file        -> replay id extracted, then fetched
+  * a bare replay id (e.g. 1901960)          -> replay/get/{id}/gz
+  * a bare match  id (e.g. 4701297)          -> match/get -> replayId -> replay
 
 FUMBBL API (https://fumbbl.com/apidoc/):
   match/get/{matchId}        -> match meta incl. ``replayId``
@@ -36,7 +39,11 @@ def _api_bytes(path: str) -> bytes:
         return r.read()
 
 
-def _replay_id_from_jnlp(text: str) -> str | None:
+def replay_id_from_jnlp(text: str) -> str | None:
+    """Extract a replay id from a FUMBBL ``.jnlp`` launcher's contents.
+
+    This step itself is offline (it just parses text); it lives here because the
+    only reason to read a ``.jnlp`` is to then fetch the replay it names."""
     # href="/ffblive.jnlp?replay=1889874..."  or  <argument>1889874</argument>
     m = re.search(r"replay=(\d+)", text)
     if m:
@@ -69,17 +76,17 @@ def resolve_replay_id_from_match(match_id: str | int) -> str | None:
     return str(rid) if rid else None
 
 
-def load_source(source) -> tuple[dict, str]:
-    """Return ``(replay_dict, replay_id)`` for any supported source."""
+def fetch_source(source) -> tuple[dict, str]:
+    """Resolve a *remote* source -- a ``.jnlp`` launcher, a replay id, or a match
+    id -- by downloading from FUMBBL.  Returns ``(replay_dict, replay_id)``.
+
+    Local replay files are handled offline by :func:`fumbblr.sources.load_source`
+    and never reach here."""
     s = str(source)
     p = Path(s)
 
-    if p.exists() and p.suffix in (".gz", ".json"):
-        rid = re.sub(r"\D", "", p.stem) or p.stem
-        return load_replay(p), rid
-
     if p.exists() and p.suffix == ".jnlp":
-        rid = _replay_id_from_jnlp(p.read_text())
+        rid = replay_id_from_jnlp(p.read_text())
         if not rid:
             raise ValueError(f"no replay id found in {p}")
         replay = fetch_replay_by_id(rid)
@@ -99,4 +106,4 @@ def load_source(source) -> tuple[dict, str]:
                 return replay, rid
         raise ValueError(f"{s} is neither a fetchable replay id nor a match id")
 
-    raise ValueError(f"unrecognised replay source: {source!r}")
+    raise ValueError(f"unrecognised remote replay source: {source!r}")

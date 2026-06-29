@@ -1,12 +1,14 @@
 """``fumbblr`` CLI: replay source(s) -> bloodygit scenario/v1 drill JSON files.
 
-    fumbblr 4701297                         # match id -> all drill families
-    fumbblr ~/Downloads/ffblive.jnlp
+    fumbblr replay_1901960.gz               # local replay file -> all families
     fumbblr replay_1901960.gz --stats       # just report what the game is good for
+    fumbblr 4701297                         # match id -> download -> all families
+    fumbblr ~/Downloads/ffblive.jnlp        # launcher -> download -> all families
 
-Each drill family is written to the bloodygit dir its curriculum reads:
-    score (clk1/2/3) -> data/drills_clock/fumbbl/
-    sack, block      -> data/scenarios_defense/fumbbl/
+Each drill family is written under the data root (default: <repo>/data),
+mirroring the bloodygit dir its curriculum reads:
+    score (clk1/2/3) -> drills_clock/fumbbl/
+    sack, block      -> scenarios_defense/fumbbl/
 """
 from __future__ import annotations
 
@@ -16,20 +18,28 @@ import sys
 from pathlib import Path
 
 from .convert import build_drills, inventory
-from .fetch import load_source
+from .sources import load_source
 
-_BG = Path(__file__).resolve().parents[2].parent / "bloodygit"
-_CLOCK = _BG / "data" / "drills_clock" / "fumbbl"
-_DEF = _BG / "data" / "scenarios_defense" / "fumbbl"
-_DIRS = {
-    "score": _CLOCK,
-    "sack": _DEF,
-    "block": _DEF,
-    "pass": _CLOCK,      # ball-delivery offence -> alongside the clk score ladder
-    "handoff": _CLOCK,
-    "foul": _DEF,        # bash/aggression -> alongside sack/block
-}
+# Drills are written under a data root (default: <repo>/data), mirroring the
+# bloodygit layout its curriculum reads, so the tree can be copied straight in:
+#   score (clk1/2/3) -> drills_clock/fumbbl/
+#   sack, block, foul -> scenarios_defense/fumbbl/
+_DATA = Path(__file__).resolve().parents[2] / "data"
 _FAMILIES = ("score", "sack", "block", "pass", "handoff", "foul")
+
+
+def _family_dirs(root: Path) -> dict:
+    """Map each family to its output dir under ``root`` (bloodygit layout)."""
+    clock = root / "drills_clock" / "fumbbl"
+    defense = root / "scenarios_defense" / "fumbbl"
+    return {
+        "score": clock,
+        "sack": defense,
+        "block": defense,
+        "pass": clock,      # ball-delivery offence -> alongside the clk score ladder
+        "handoff": clock,
+        "foul": defense,    # bash/aggression -> alongside sack/block
+    }
 
 
 def _print_inventory(inv: dict) -> None:
@@ -49,9 +59,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="fumbblr", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sources", nargs="+",
-                    help="replay/match id, .jnlp, or local .gz/.json replay file")
+                    help="local .gz/.json replay file (offline), or -- with "
+                         "downloading enabled -- a replay id, match id, or .jnlp")
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="offline mode: accept local replay files only, never download")
     ap.add_argument("--out", type=Path, default=None,
-                    help="override output root (default: the bloodygit data dirs)")
+                    help="output root for the drill tree (default: <repo>/data)")
     ap.add_argument("--turns-before", type=int, default=2,
                     help="turns before each TD to snapshot (default: 2 -> clk1..3)")
     ap.add_argument("--min-blocks", type=int, default=3,
@@ -65,10 +78,12 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     families = [f.strip() for f in args.families.split(",") if f.strip()]
 
+    dirs = _family_dirs(args.out or _DATA)
+
     totals: dict = {}
     for src in args.sources:
         try:
-            replay, rid = load_source(src)
+            replay, rid = load_source(src, allow_fetch=not args.no_fetch)
         except Exception as e:  # noqa: BLE001 - clean per-source message
             print(f"!! {src}: {e}", file=sys.stderr)
             continue
@@ -86,7 +101,7 @@ def main(argv=None) -> int:
               + "  ".join(f"{k}:{n.get(k, 0)}" for k in _FAMILIES))
         for fam in families:
             drills = fams.get(fam, [])
-            out_dir = (args.out / fam) if args.out else _DIRS[fam]
+            out_dir = dirs[fam]
             if drills and not (args.dry_run):
                 out_dir.mkdir(parents=True, exist_ok=True)
             for d in drills:
@@ -95,7 +110,8 @@ def main(argv=None) -> int:
                     (out_dir / f"{d['id']}.json").write_text(json.dumps(d, indent=2))
 
     if not args.stats:
-        where = "(dry run)" if args.dry_run else "written to bloodygit data dirs"
+        root = args.out or _DATA
+        where = "(dry run)" if args.dry_run else f"written under {root}"
         summary = "  ".join(f"{k}:{v}" for k, v in sorted(totals.items())) or "none"
         print(f"\ntotal drills: {summary}  {where}")
     return 0
