@@ -1,0 +1,23 @@
+[project]
+name = "fumbblr"
+version = "0.1.0"
+description = "Convert FUMBBL (FFB) Blood Bowl replays into bloodygit training drills (scenario/v1)."
+requires-python = ">=3.10"
+dependencies = []  # stdlib only (urllib, gzip, json)
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+fumbblr = "fumbblr.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
