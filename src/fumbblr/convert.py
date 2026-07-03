@@ -1,14 +1,21 @@
 """Replay snapshots -> bloodygit ``scenario/v1`` pinned drills.
 
-Three drill families are mined from one replay, each landing in the bloodygit
+The drill families mined from one replay, each landing in the bloodygit
 dir its curriculum already reads (family = ``id.rsplit("_", 1)[0]``):
 
-* **scoring** (``clk1`` / ``clk2`` / ``clk3``): the start of the scoring team's
-  turn 0 / 1 / 2 turns before a touchdown -> the score-in-N-turns depth ladder
-  (``--curriculum-rungs clk1,clk2,...``).  Dir: ``data/drills_clock/fumbbl/``.
+* **scoring** (``fclk1`` / ``fclk2`` / ``fclk3``): the start of the scoring
+  team's turn 0 / 1 / 2 turns before a touchdown -> the score-in-N-turns depth
+  ladder from real human TDs (``--curriculum-rungs fclk1,fclk2,...``).
+  Dir: ``data/drills_clock/fumbbl/``.
+* **drop** (``drop1``): the start of the turn in which a team knocked the ball
+  out of the enemy carrier's hands (defense-forced turnover) -> force-the-drop
+  drills (bloodygit ``balldown`` objective, ``active_team`` = the forcing side).
+  Dir: ``data/drills_drop/fumbbl/``.
 * **sack** (``sack``): the start of the defending team's turn in which they
-  blitzed the enemy ball-carrier -> win-the-ball drills (``--defense-dir``,
-  ``active_team`` = defender).  Dir: ``data/scenarios_defense/fumbbl/``.
+  blitzed the enemy ball-carrier (carrier attacked, ball not necessarily lost)
+  -> win-the-ball drills, second rung of the defense ladder.
+  Dir: ``data/drills_drop/fumbbl/``.  A turn that actually dislodged the ball
+  emits only ``drop1`` (drop takes precedence).
 * **block** (``block``): the start of a heavy-block turn (bash pressure).
   Dir: ``data/scenarios_defense/fumbbl/``.
 
@@ -155,12 +162,12 @@ def _scoring_drills(parsed, replay_id, turns_before) -> list[dict]:
             if snap is None:
                 continue
             clk = offset + 1
-            desc = (f"FUMBBL replay {replay_id}: {clk}-turn score (clk{clk}) — start "
+            desc = (f"FUMBBL replay {replay_id}: {clk}-turn score (fclk{clk}) — start "
                     f"of the attacking team's turn {offset} before a TD "
                     f"(half {snap.half}, turn {snap.turn}). Real teams reproduced.")
             out.append(_drill(
                 snap, td.team, self_seat, parsed,
-                drill_id=f"clk{clk}_{_idx(replay_id, seq)}",
+                drill_id=f"fclk{clk}_{_idx(replay_id, seq)}",
                 themes=["score_run"], desc=desc,
                 source={"kind": "fumbbl_replay", "replay_id": str(replay_id),
                         "drill": "score", "scorer_id": td.scorer_id,
@@ -169,16 +176,46 @@ def _scoring_drills(parsed, replay_id, turns_before) -> list[dict]:
     return out
 
 
-def _sack_drills(parsed, replay_id) -> tuple[list[dict], set]:
+def _drop_drills(parsed, replay_id) -> tuple[list[dict], set]:
+    """Turn-start before a team knocked the ball out of the enemy carrier's
+    hands. Returns the drills and the set of (half, team, turn) keys used (so
+    sack/block drills skip them -- drop takes precedence)."""
+    out, seq, keys = [], 0, set()
+    for d in parsed.drops:
+        if d.def_team not in parsed.team_attacks:
+            continue
+        key = (d.half, d.def_team, d.turn)
+        if key in keys:
+            continue
+        snap = parsed.snapshot_for(d.half, d.def_team, d.turn)
+        if snap is None:
+            continue
+        keys.add(key)
+        self_seat = _seat_for(parsed.team_attacks[d.def_team])
+        desc = (f"FUMBBL replay {replay_id}: force the drop — start of the "
+                f"defending team's turn (half {snap.half}, turn {snap.turn}); "
+                f"they knocked the ball loose. Real teams reproduced.")
+        out.append(_drill(
+            snap, d.def_team, self_seat, parsed,
+            drill_id=f"drop1_{_idx(replay_id, seq)}",
+            themes=["force_drop"], desc=desc,
+            source={"kind": "fumbbl_replay", "replay_id": str(replay_id),
+                    "drill": "drop", "carrier_id": d.carrier_id,
+                    "cause": d.cause}))
+        seq += 1
+    return out, keys
+
+
+def _sack_drills(parsed, replay_id, skip_keys=frozenset()) -> tuple[list[dict], set]:
     """Defender's turn-start before they blitz the enemy carrier. Returns the
     drills and the set of (half, team, turn) keys used (so block drills skip
-    them)."""
+    them). Turns in ``skip_keys`` (already emitted as drop drills) are skipped."""
     out, seq, keys, seen = [], 0, set(), set()
     for s in parsed.sacks:
         if s.def_team not in parsed.team_attacks:
             continue
         key = (s.half, s.def_team, s.turn)
-        if key in seen:
+        if key in seen or key in skip_keys:
             continue
         seen.add(key)
         snap = parsed.snapshot_for(s.half, s.def_team, s.turn)
@@ -278,14 +315,17 @@ def _action_count(parsed, events) -> int:
 # public API
 # --------------------------------------------------------------------------- #
 def build_drills(replay: dict, *, replay_id, turns_before=2, min_blocks=3) -> dict:
-    """All drill families mined from a replay: ``{"score", "sack", "block",
-    "pass", "handoff", "foul"}`` (each a list of scenario/v1 dicts)."""
+    """All drill families mined from a replay: ``{"score", "drop", "sack",
+    "block", "pass", "handoff", "foul"}`` (each a list of scenario/v1 dicts)."""
     parsed = ParsedReplay(replay)
-    sack, sack_keys = _sack_drills(parsed, replay_id)
+    drop, drop_keys = _drop_drills(parsed, replay_id)
+    sack, sack_keys = _sack_drills(parsed, replay_id, skip_keys=drop_keys)
     return {
         "score": _scoring_drills(parsed, replay_id, turns_before),
+        "drop": drop,
         "sack": sack,
-        "block": _block_drills(parsed, replay_id, min_blocks, sack_keys),
+        "block": _block_drills(parsed, replay_id, min_blocks,
+                               sack_keys | drop_keys),
         "pass": _action_drills(parsed, replay_id, parsed.pass_events, "pass"),
         "handoff": _action_drills(parsed, replay_id, parsed.handoff_events,
                                   "handoff"),
@@ -303,24 +343,30 @@ def inventory(replay: dict, *, replay_id, turns_before=2, min_blocks=3) -> dict:
     """What a replay is good for — drill yields + raw event counts, for triage."""
     parsed = ParsedReplay(replay)
     inv = parsed.inventory
+    drop_keys = {(d.half, d.def_team, d.turn) for d in parsed.drops
+                 if d.def_team in parsed.team_attacks}
     sack_keys = {(s.half, s.def_team, s.turn) for s in parsed.sacks
-                 if s.def_team in parsed.team_attacks}
+                 if s.def_team in parsed.team_attacks} - drop_keys
     return {
         "replay_id": str(replay_id),
         "matchup": [parsed.races.get("home"), parsed.races.get("away")],
         "drills": {
             "score": sum(1 for td in parsed.touchdowns
                          for o in range(turns_before + 1) if td.turn - o >= 1),
+            "drop": len(drop_keys),
             "sack": len(sack_keys),
             "block": sum(1 for b in parsed.block_turns(min_blocks)
                          if b.team in parsed.team_attacks
-                         and (b.half, b.team, b.turn) not in sack_keys),
+                         and (b.half, b.team, b.turn) not in sack_keys
+                         and (b.half, b.team, b.turn) not in drop_keys),
             "pass": _action_count(parsed, parsed.pass_events),
             "handoff": _action_count(parsed, parsed.handoff_events),
             "foul": _action_count(parsed, parsed.foul_events),
         },
         "events": {
             "touchdowns": len(parsed.touchdowns),
+            "drops_forced": len(parsed.drops),
+            "offense_turn_drops": inv.get("offense_turn_drop", 0),
             "passes": len(parsed.passes),
             "blocks": inv.get("block", 0),
             "blitzes": inv.get("selectBlitzTarget", 0),

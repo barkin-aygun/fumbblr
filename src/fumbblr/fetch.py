@@ -21,8 +21,10 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import re
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -32,11 +34,60 @@ _UA = "fumbblr (bloodygit training-drill converter; single-replay fetch)"
 _CACHE = Path.home() / ".cache" / "fumbblr"
 _BASE = "https://fumbbl.com/api"
 
+# Politeness: the FUMBBL site owner asked downloads be kept low, so fumbblr is
+# deliberately slow.  Every request waits this long *after* completing, and
+# transient failures (rate limiting, 5xx) back off exponentially rather than
+# retrying in a tight loop.  Override the post-request delay with FUMBBLR_DELAY
+# (seconds).  The default is intentionally leisurely -- the harvester is meant
+# to trickle games in over days, not race.
+_DELAY = float(os.environ.get("FUMBBLR_DELAY", "5.0"))
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_MAX_RETRIES = 5
+
+
+class RateLimited(RuntimeError):
+    """Raised when FUMBBL keeps returning 429 after our backoff is exhausted.
+
+    The harvester catches this to stop the current batch early and let the next
+    scheduled run try again later, instead of hammering a server that has
+    explicitly asked us to slow down."""
+
+
+def _fetch_bytes(url: str, *, data: bytes | None = None,
+                 headers: dict | None = None, timeout: int = 60) -> bytes:
+    """Fetch ``url`` (GET, or POST if ``data`` is given) with a polite delay and
+    exponential backoff on transient errors.  Raises :class:`RateLimited` if
+    429s outlast our retries."""
+    hdrs = {"User-Agent": _UA, **(headers or {})}
+    last_429 = False
+    for attempt in range(_MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, data=data, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+            if _DELAY:
+                time.sleep(_DELAY)
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRY_STATUS or attempt == _MAX_RETRIES - 1:
+                if e.code == 429:
+                    raise RateLimited(f"429 Too Many Requests for {url}") from e
+                raise
+            last_429 = e.code == 429
+            # Honour Retry-After when the server sends it; else exp backoff.
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            wait = float(retry_after) if (retry_after and retry_after.isdigit()) \
+                else min(60.0, 2.0 ** attempt * max(1.0, _DELAY))
+            time.sleep(wait)
+        except urllib.error.URLError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            time.sleep(min(60.0, 2.0 ** attempt * max(1.0, _DELAY)))
+    raise RateLimited(f"gave up on {url}") if last_429 else RuntimeError(url)
+
 
 def _api_bytes(path: str) -> bytes:
-    req = urllib.request.Request(f"{_BASE}/{path}", headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+    return _fetch_bytes(f"{_BASE}/{path}")
 
 
 def replay_id_from_jnlp(text: str) -> str | None:
@@ -65,7 +116,6 @@ def fetch_replay_by_id(replay_id: str | int, *, cache=True) -> dict | None:
         return None
     if cache:
         cached.write_bytes(raw)
-    time.sleep(0.3)  # be polite
     with gzip.open(io.BytesIO(raw), "rb") as f:
         return json.load(f)
 

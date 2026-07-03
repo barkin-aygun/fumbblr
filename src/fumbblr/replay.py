@@ -15,7 +15,9 @@ Model-change ids we consume (verified against real 2007 and 2026 replays):
   fieldModelSetPlayerCoordinate  key=playerId  value=[x, y]
   fieldModelSetPlayerState       key=playerId  value=int (base = value & 255)
   fieldModelSetBallCoordinate                  value=[x, y] (or None / 0)
+  fieldModelSetBallMoving                      value=bool (True = ball NOT possessed)
   fieldModelRemovePlayer         key=playerId
+  gameSetHomePlaying                           value=bool (whose turn is active)
   turnDataSetTurnNr              key=home|away value=int (that team's turn no.)
   turnDataSetReRolls             key=home|away value=int
   gameSetHalf                                  value=int (1 or 2)
@@ -141,6 +143,8 @@ class FieldState:
     coord: dict = field(default_factory=dict)   # player_id -> [x, y]
     state: dict = field(default_factory=dict)   # player_id -> base PlayerState int
     ball: list = field(default_factory=lambda: [-1, -1])
+    ball_moving: bool = True                    # True = ball not possessed (FFB)
+    active: str | None = None                   # whose turn is live ("home"/"away")
     half: int = 0
     turn_mode: str = "startGame"
     turn: dict = field(default_factory=lambda: {"home": 0, "away": 0})
@@ -169,6 +173,18 @@ class Touchdown:
     command_nr: int
     end_zone_x: int     # 0 or 25 -- the end zone the scorer reached
     score: dict         # running score immediately after the TD
+
+
+@dataclass
+class Drop:
+    """The opposing carrier lost the ball during ``def_team``'s active turn --
+    a defense-forced turnover (blitz knockdown, Strip Ball, crowd-push)."""
+    half: int
+    def_team: str       # the team that forced the drop (the drill's "self")
+    turn: int           # that team's turn number
+    command_nr: int
+    carrier_id: str     # the enemy player who lost the ball
+    cause: str          # "block" (a block on the carrier this turn) | "other"
 
 
 @dataclass
@@ -205,8 +221,9 @@ class ActionEvent:
 
 class ParsedReplay:
     """One linear pass over the command stream: collects turn-start snapshots,
-    touchdowns, sacks (blocks on the carrier), per-turn block counts, passes,
-    each team's attacking end zone, and a drill-type inventory."""
+    touchdowns, sacks (blocks on the carrier), drops (defense-forced ball
+    losses), per-turn block counts, passes, each team's attacking end zone,
+    and a drill-type inventory."""
 
     def __init__(self, replay: dict):
         self.replay = replay
@@ -216,6 +233,7 @@ class ParsedReplay:
         self.snapshots: list[TurnSnapshot] = []
         self.touchdowns: list[Touchdown] = []
         self.sacks: list[Sack] = []
+        self.drops: list[Drop] = []
         self.passes: list[dict] = []
         self.pass_events: list[ActionEvent] = []     # pass throws (by acting team)
         self.handoff_events: list[ActionEvent] = []  # hand-offs
@@ -256,10 +274,13 @@ class ParsedReplay:
     def _parse(self) -> None:
         st = FieldState()
         acting = None        # current acting player id
+        holder = None        # last known ball carrier (ball_moving == False)
+        drop_keys: set = set()   # (half, def_team, turn) already emitted
         for cmd in self.replay["gameLog"]["commandArray"]:
             if cmd.get("netCommandId") != "serverModelSync":
                 continue
             cn = cmd.get("commandNr")
+            was_moving = st.ball_moving
             turn_started: list[tuple[str, int]] = []
 
             for ch in cmd["modelChangeList"]["modelChangeArray"]:
@@ -272,6 +293,8 @@ class ParsedReplay:
                     st.state[ck] = int(cv) & 255
                 elif cid == "fieldModelSetBallCoordinate" and hasattr(cv, "__len__"):
                     st.ball = list(cv)
+                elif cid == "fieldModelSetBallMoving":
+                    st.ball_moving = bool(cv)
                 elif cid == "fieldModelRemovePlayer":
                     st.coord.pop(ck, None)
                     st.state.pop(ck, None)
@@ -279,6 +302,8 @@ class ParsedReplay:
                     st.half = cv
                 elif cid == "gameSetTurnMode":
                     st.turn_mode = cv
+                elif cid == "gameSetHomePlaying":
+                    st.active = "home" if cv else "away"
                 elif cid == "turnDataSetReRolls":
                     st.rerolls[ck] = cv
                 elif cid == "teamResultSetScore":
@@ -296,10 +321,12 @@ class ParsedReplay:
                         half=st.half, team=team, turn=turn,
                         command_nr=cn, field=st.clone()))
 
+            td_this_cmd = False
             for rep in cmd["reportList"]["reports"]:
                 rid = rep.get("reportId")
                 self.inventory[rid] += 1
                 if rid == "turnEnd" and rep.get("playerIdTouchdown"):
+                    td_this_cmd = True
                     scorer = rep["playerIdTouchdown"]
                     team = self.team_of(scorer) or "home"
                     # The scorer is already in the dugout by the time the turnEnd
@@ -328,6 +355,38 @@ class ParsedReplay:
                     self._record_action(st, rid, rep, acting, cn)
                 elif rid == "foul":
                     self._record_action(st, rid, rep, acting, cn)
+
+            # -- drop detection: possessed -> loose at a command boundary ---- #
+            # ``ball_moving`` flips True only when the ball leaves possession
+            # (kick, throw, knockdown, strip); mid-play ("regular") transitions
+            # where the OTHER team is active are defense-forced turnovers.
+            # Kickoff scatters live in turn_mode "kickoff" and TD resets flag
+            # ``td_this_cmd``, so both are excluded.
+            if (not was_moving) and st.ball_moving and holder \
+                    and st.turn_mode == "regular" and not td_this_cmd:
+                h_team = self.team_of(holder)
+                if h_team and st.active:
+                    if st.active != h_team:
+                        key = (st.half, st.active, st.turn.get(st.active, 0))
+                        if key not in drop_keys:
+                            drop_keys.add(key)
+                            cause = "block" if any(
+                                (s.half, s.def_team, s.turn) == key
+                                for s in self.sacks) else "other"
+                            self.drops.append(Drop(
+                                half=st.half, def_team=st.active,
+                                turn=st.turn.get(st.active, 0), command_nr=cn,
+                                carrier_id=holder, cause=cause))
+                    else:
+                        # the carrier's own side let go (failed pickup/pass/
+                        # dodge) -- not a defense drill; counted for triage.
+                        self.inventory["offense_turn_drop"] += 1
+
+            # track the carrier across commands (drops need the *previous* one)
+            if st.ball_moving:
+                holder = None
+            else:
+                holder = self._carrier(st) or holder
 
     def _record_action(self, st, rid, rep, acting, cn) -> None:
         """Bucket a pass / hand-off / foul report under the acting team's turn."""

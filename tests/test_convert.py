@@ -26,18 +26,51 @@ def test_touchdowns_and_events_detected():
     assert p.team_attacks and set(p.team_attacks) == {"home", "away"}
 
 
-def test_three_families_and_clk_ladder():
+def test_drops_detected():
+    """Defense-forced ball losses are found, deduped per defending turn, and
+    never credited to the carrier's own team."""
+    p = ParsedReplay(_replay())
+    assert len(p.drops) == 2
+    keys = {(d.half, d.def_team, d.turn) for d in p.drops}
+    assert len(keys) == len(p.drops)               # deduped
+    for d in p.drops:
+        assert p.team_of(d.carrier_id) != d.def_team
+        assert d.cause in ("block", "other")
+
+
+def test_families_and_fclk_ladder():
     fams = build_drills(_replay(), replay_id="1901960")
     assert len(fams["score"]) == 9 and len(fams["sack"]) >= 1 and len(fams["block"]) >= 1
-    # scoring drills form a clk1/clk2/clk3 ladder (family = id.rsplit("_",1)[0])
+    assert len(fams["drop"]) == 2
+    # scoring drills form an fclk1/fclk2/fclk3 ladder (family = id.rsplit("_",1)[0])
     clk = {d["id"].rsplit("_", 1)[0] for d in fams["score"]}
-    assert clk == {"clk1", "clk2", "clk3"}
+    assert clk == {"fclk1", "fclk2", "fclk3"}
     for d in fams["score"]:
-        assert d["source"]["clk"] == int(d["id"].rsplit("_", 1)[0][3:])
-    # sack/block families resolve correctly too
+        assert d["source"]["clk"] == int(d["id"].rsplit("_", 1)[0][4:])
+    # drop/sack/block families resolve correctly too
+    assert all(d["id"].rsplit("_", 1)[0] == "drop1" for d in fams["drop"])
     assert all(d["id"].rsplit("_", 1)[0] == "sack" for d in fams["sack"])
     assert all(d["id"].rsplit("_", 1)[0] == "block" for d in fams["block"])
     assert drills_from_replay(_replay(), replay_id="1901960") == fams["score"]
+
+
+def test_drop_drills_are_forcer_active_and_skip_sacks():
+    """Drop drills put the forcing side on active_team with the ENEMY holding
+    the ball; a turn emitted as a drop never re-emits as a sack."""
+    p = ParsedReplay(_replay())
+    fams = build_drills(_replay(), replay_id="1901960")
+    for d in fams["drop"]:
+        assert d["themes"] == ["force_drop"]
+        assert d["source"]["drill"] == "drop"
+        hb = d["board"]["ball"]["held_by"]
+        if hb >= 0:                                # the ENEMY carrier holds the ball
+            assert hb // N_TEAM_SLOTS != d["board"]["active_team"]
+    # drop takes precedence: a turn emitted as drop1 never re-emits as sack
+    drop_keys = {(x.half, x.def_team, x.turn) for x in p.drops
+                 if x.def_team in p.team_attacks}
+    sack_keys = {(s.half, s.def_team, s.turn) for s in p.sacks
+                 if s.def_team in p.team_attacks}
+    assert len(fams["sack"]) == len(sack_keys - drop_keys)
 
 
 def test_sack_drills_are_defender_active():
@@ -85,5 +118,7 @@ def test_inventory_triage():
     inv = inventory(_replay(), replay_id="1901960")
     assert inv["matchup"] == ["High Elf", "Tomb Kings"]
     assert inv["drills"]["score"] == 9
+    assert inv["drills"]["drop"] == 2
+    assert inv["events"]["drops_forced"] == 2
     assert inv["events"]["passes"] == 1            # bash game: ~no passing
     assert inv["events"]["blocks"] == 57

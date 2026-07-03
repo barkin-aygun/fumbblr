@@ -58,6 +58,80 @@ replay = fetch_replay_by_id(1901960)            # cached under ~/.cache/fumbblr/
 Network fetches are single-replay, cached on disk, and polite (identifying
 User-Agent, small delay). This is a converter, **not** a bulk scraper.
 
+---
+
+## Harvesting good games by top coaches (`fumbblr-harvest`)
+
+Beyond converting one replay you already have, fumbblr can go **find** replays
+worth converting: the best recent games played by FUMBBL's strongest coaches.
+This is still deliberately gentle — the site owner asked that downloads be kept
+low, so the harvester trickles a small batch at a time over days, waits several
+seconds between every request, and backs off the moment it's rate-limited.
+
+How it decides what's worth downloading — all from small metadata endpoints,
+**before** any replay is fetched:
+
+1. **Top coaches** come from FUMBBL's public toplist
+   (`POST /api/clickhouse/topList`); each coach id is resolved via
+   `/api/team/get/{teamId}`. (Or skip discovery and name coach ids yourself with
+   `--coaches`.)
+2. **Recent games** for each coach come from `xml:matches?c=<coachId>` — ~26
+   matches each, with per-game touchdowns, casualties, blocks, passing and
+   completions already in the XML.
+3. **Ranking** scores each game by *action density* — weighting the rare,
+   high-signal events (touchdowns, completed passes) most, favouring contested
+   scorelines, and lightly counting bash — so games rich in good training
+   moments float to the top of the queue.
+
+Only then, one game at a time, does it resolve `match → replayId → replay`
+(2 requests each, reusing the cached, polite `fetch` path), build all six drill
+families, and write them in the usual bloodygit layout.
+
+Everything is recorded in a crash-safe **state file** (`<out>/harvest_state.json`):
+the ranked queue, every game already done (never re-downloaded), failures,
+the cached coach roster, and cumulative drill totals. So the harvester is safe to
+run on a timer and simply resumes where it left off.
+
+```bash
+fumbblr-harvest                       # one polite batch (default 3 games)
+fumbblr-harvest -n 5                   # up to 5 games this run
+fumbblr-harvest --coaches 3893,52015  # mine specific coach ids, skip the toplist
+fumbblr-harvest --refresh             # re-pull the toplist / rebuild the queue
+fumbblr-harvest --status              # print state summary (no downloads)
+fumbblr-harvest --dry-run -n 3        # resolve + convert but write nothing
+```
+
+| Option | Default | Effect |
+|---|---|---|
+| `-n, --num N` | 3 | max games to process this run |
+| `--out DIR` | `<repo>/data` | output root (same tree as `fumbblr`) |
+| `--state FILE` | `<out>/harvest_state.json` | state file path |
+| `--coaches IDS` | — | comma-separated coach ids; skips toplist discovery |
+| `--top-n N` | 15 | how many top coaches to pull from the toplist |
+| `--per-coach N` | 6 | best-N recent games taken per coach |
+| `--min-score X` | 8.0 | skip games below this action-density score |
+| `--division ID` | 2 | FUMBBL division to mine (2=Competitive), or `all` |
+| `--refresh` | off | re-pull the toplist and rebuild the queue first |
+| `--status` | off | print state summary and exit (no network) |
+| `--dry-run` | off | download + convert but write no files |
+
+### Running it over several days
+
+`scripts/harvest_overnight.sh` loops the harvester: a small batch, a long sleep,
+repeat. Start it detached and leave it — the state file means each wake-up picks
+up where the last left off:
+
+```bash
+nohup scripts/harvest_overnight.sh > harvest.out 2>&1 &     # 3 games / 20 min
+BATCH=2 INTERVAL=1800 scripts/harvest_overnight.sh          # 2 games / 30 min
+```
+
+Tunables (env vars): `BATCH` (games/wake-up), `INTERVAL` (seconds between),
+`MAX_BATCHES` (stop after N, `0`=forever), and `FUMBBLR_DELAY` (per-request
+politeness delay in seconds, default **5**; honoured by every fumbblr request).
+At the defaults that's ~9 games/hour with a 5s gap between requests — a trickle,
+not a scrape.
+
 ### Modules
 
 | Module | Role | Network |
@@ -65,9 +139,13 @@ User-Agent, small delay). This is a converter, **not** a bulk scraper.
 | `replay.py` | parse the command stream, reconstruct the board, detect events | none |
 | `convert.py` | turn detected events into `scenario/v1` drill dicts | none |
 | `mapping.py` | FFB ↔ bloodygit constants (board, player status, race/skill names) | none |
+| `output.py` | the bloodygit-mirroring drill layout on disk (shared writer) | none |
 | `sources.py` | resolve a source → `(replay, id)`; **offline** for files | none |
-| `fetch.py` | **optional**: download a replay/match/jnlp from FUMBBL | yes |
-| `cli.py` | argument parsing, family selection, file output | none |
+| `fetch.py` | **optional**: download a replay/match/jnlp from FUMBBL (polite, backs off) | yes |
+| `coaches.py` | **optional**: discover top coaches + rank their recent games (metadata only) | yes |
+| `harvest.py` | **optional**: stateful, crash-safe batch harvester (find → convert → write) | yes |
+| `cli.py` | `fumbblr`: argument parsing, family selection, file output | none |
+| `harvest_cli.py` | `fumbblr-harvest`: the harvest batch CLI | yes |
 
 ---
 

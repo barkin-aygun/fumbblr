@@ -7,49 +7,36 @@
 
 Each drill family is written under the data root (default: <repo>/data),
 mirroring the bloodygit dir its curriculum reads:
-    score (clk1/2/3) -> drills_clock/fumbbl/
-    sack, block      -> scenarios_defense/fumbbl/
+    score (fclk1/2/3) -> drills_clock/fumbbl/
+    drop, sack        -> drills_drop/fumbbl/
+    block, foul       -> scenarios_defense/fumbbl/
+(every fifth replay's drills go under eval_holdout/ -- see fumbblr.output)
 """
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from .convert import build_drills, inventory
+from .output import FAMILIES as _FAMILIES
+from .output import write_families
 from .sources import load_source
 
-# Drills are written under a data root (default: <repo>/data), mirroring the
-# bloodygit layout its curriculum reads, so the tree can be copied straight in:
-#   score (clk1/2/3) -> drills_clock/fumbbl/
-#   sack, block, foul -> scenarios_defense/fumbbl/
+# Drills are written under a data root (default: <repo>/data); the layout lives
+# in fumbblr.output, shared with the harvester.
 _DATA = Path(__file__).resolve().parents[2] / "data"
-_FAMILIES = ("score", "sack", "block", "pass", "handoff", "foul")
-
-
-def _family_dirs(root: Path) -> dict:
-    """Map each family to its output dir under ``root`` (bloodygit layout)."""
-    clock = root / "drills_clock" / "fumbbl"
-    defense = root / "scenarios_defense" / "fumbbl"
-    return {
-        "score": clock,
-        "sack": defense,
-        "block": defense,
-        "pass": clock,      # ball-delivery offence -> alongside the clk score ladder
-        "handoff": clock,
-        "foul": defense,    # bash/aggression -> alongside sack/block
-    }
 
 
 def _print_inventory(inv: dict) -> None:
     m = inv["matchup"]
     print(f"{inv['replay_id']}: {m[0]} vs {m[1]}")
     d, e = inv["drills"], inv["events"]
-    print(f"   drills available  -> score(clk):{d['score']:2d}  sack:{d['sack']:2d}  "
-          f"block:{d['block']:2d}  pass:{d['pass']:2d}  handoff:{d['handoff']:2d}  "
-          f"foul:{d['foul']:2d}")
-    print(f"   events            -> TDs:{e['touchdowns']} passes:{e['passes']} "
+    print(f"   drills available  -> score(fclk):{d['score']:2d}  drop:{d['drop']:2d}  "
+          f"sack:{d['sack']:2d}  block:{d['block']:2d}  pass:{d['pass']:2d}  "
+          f"handoff:{d['handoff']:2d}  foul:{d['foul']:2d}")
+    print(f"   events            -> TDs:{e['touchdowns']} "
+          f"drops_forced:{e['drops_forced']} passes:{e['passes']} "
           f"blocks:{e['blocks']} blitzes:{e['blitzes']} injuries:{e['injuries']} "
           f"pickups:{e['pickups']} scatters:{e['ball_scatters']} "
           f"kickoffs:{e['kickoffs']} stallers:{e['stallers']}")
@@ -75,10 +62,12 @@ def main(argv=None) -> int:
                     help="report each replay's drill yield + event counts, write nothing")
     ap.add_argument("--dry-run", action="store_true",
                     help="print a summary, write nothing")
+    ap.add_argument("--no-holdout", action="store_true",
+                    help="write every drill to the main tree (skip the "
+                         "eval_holdout/ per-replay split)")
     args = ap.parse_args(argv)
     families = [f.strip() for f in args.families.split(",") if f.strip()]
-
-    dirs = _family_dirs(args.out or _DATA)
+    root = args.out or _DATA
 
     totals: dict = {}
     for src in args.sources:
@@ -99,18 +88,12 @@ def main(argv=None) -> int:
         n = {k: len(v) for k, v in fams.items()}
         print(f"{src}: replay {rid} -> "
               + "  ".join(f"{k}:{n.get(k, 0)}" for k in _FAMILIES))
-        for fam in families:
-            drills = fams.get(fam, [])
-            out_dir = dirs[fam]
-            if drills and not (args.dry_run):
-                out_dir.mkdir(parents=True, exist_ok=True)
-            for d in drills:
-                totals[fam] = totals.get(fam, 0) + 1
-                if not args.dry_run:
-                    (out_dir / f"{d['id']}.json").write_text(json.dumps(d, indent=2))
+        for fam, cnt in write_families(fams, root, families=families,
+                                       dry_run=args.dry_run,
+                                       holdout=not args.no_holdout).items():
+            totals[fam] = totals.get(fam, 0) + cnt
 
     if not args.stats:
-        root = args.out or _DATA
         where = "(dry run)" if args.dry_run else f"written under {root}"
         summary = "  ".join(f"{k}:{v}" for k, v in sorted(totals.items())) or "none"
         print(f"\ntotal drills: {summary}  {where}")

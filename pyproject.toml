@@ -10,6 +10,7 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 fumbblr = "fumbblr.cli:main"
+fumbblr-harvest = "fumbblr.harvest_cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]
