@@ -195,13 +195,21 @@ def _drop_drills(parsed, replay_id) -> tuple[list[dict], set]:
         desc = (f"FUMBBL replay {replay_id}: force the drop — start of the "
                 f"defending team's turn (half {snap.half}, turn {snap.turn}); "
                 f"they knocked the ball loose. Real teams reproduced.")
-        out.append(_drill(
+        drill = _drill(
             snap, d.def_team, self_seat, parsed,
             drill_id=f"drop1_{_idx(replay_id, seq)}",
             themes=["force_drop"], desc=desc,
             source={"kind": "fumbbl_replay", "replay_id": str(replay_id),
                     "drill": "drop", "carrier_id": d.carrier_id,
-                    "cause": d.cause}))
+                    "cause": d.cause})
+        # The drill's premise is "the ENEMY carries — knock it loose": a
+        # snapshot where the ball is already loose (or somehow on the forcing
+        # side) would be an instant win under bloodygit's balldown objective.
+        held = drill["board"]["ball"]["held_by"]
+        if held < 0 or held // N_TEAM_SLOTS == self_seat:
+            keys.discard(key)          # let the turn fall back to sack/block
+            continue
+        out.append(drill)
         seq += 1
     return out, keys
 
