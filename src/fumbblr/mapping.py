@@ -83,6 +83,12 @@ def map_race(ffb_race: str) -> str:
 _SKILL_ALIASES: dict = {
     "Ball and Chain": "Ball & Chain",
     "Pro ": "Pro",
+    # FFB spells these differently from bloodygit; without the alias the skill
+    # was DROPPED from every replayed board (silent corpus corruption,
+    # found 2026-07-04: 'Side Step' x101 lost Sidestep entirely).
+    "Side Step": "Sidestep",
+    "No Hands": "No Ball",
+    "Fumblerooskie": "Fumblerooski",
 }
 _CONNECTIVES = {"the", "of", "and", "in", "a"}
 
